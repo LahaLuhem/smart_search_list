@@ -3,6 +3,7 @@ import 'package:flutter/rendering.dart';
 
 import '../core/smart_search_controller.dart';
 import '../models/accessibility_configuration.dart';
+import '../models/async_loader.dart';
 import '../models/grid_configuration.dart';
 import '../models/search_configuration.dart';
 import 'default_widgets.dart';
@@ -79,6 +80,7 @@ class SmartSearchGrid<T extends Object> extends SmartSearchWidgetBase<T> {
     super.key,
     super.items,
     super.asyncLoader,
+    super.pagedAsyncLoader,
     super.searchableFields,
     required super.itemBuilder,
     super.controller,
@@ -147,7 +149,8 @@ class SmartSearchGrid<T extends Object> extends SmartSearchWidgetBase<T> {
     Object Function(T item)? groupBy,
     GroupHeaderBuilder? groupHeaderBuilder,
     Comparator<Object>? groupComparator,
-    AccessibilityConfiguration accessibilityConfig = const AccessibilityConfiguration(),
+    AccessibilityConfiguration accessibilityConfig =
+        const AccessibilityConfiguration(),
   }) : this._(
          key: key,
          items: items,
@@ -182,16 +185,24 @@ class SmartSearchGrid<T extends Object> extends SmartSearchWidgetBase<T> {
 
   /// Creates an async searchable grid that loads data from a remote source.
   ///
-  /// The [asyncLoader] is called with a search query, page index (zero-based),
-  /// and page size. It is called with an empty string on initial load — handle
-  /// `''` as "load all".
+  /// Provide exactly one loader:
+  /// - [asyncLoader] returns a plain list; the controller infers whether more
+  ///   pages exist from the returned length (`items.length == pageSize`).
+  /// - [pagedAsyncLoader] returns a [SearchPage] that states `hasMore`
+  ///   explicitly — use it for variable-sized pages or when an empty page is
+  ///   not the end of the data.
+  ///
+  /// The loader is called with a search query, page index (zero-based), and
+  /// page size, and with an empty string on initial load — handle `''` as
+  /// "load all".
   ///
   /// Search matching is delegated to the server; [searchableFields] is not
   /// accepted. The widget creates and manages its own [SmartSearchController]
   /// internally.
   const SmartSearchGrid.async({
     Key? key,
-    required Future<List<T>> Function(String query, {int page, int pageSize}) asyncLoader,
+    AsyncLoader<T>? asyncLoader,
+    PagedAsyncLoader<T>? pagedAsyncLoader,
     required ItemBuilder<T> itemBuilder,
     required GridConfiguration gridConfig,
     SearchFieldBuilder? searchFieldBuilder,
@@ -218,10 +229,12 @@ class SmartSearchGrid<T extends Object> extends SmartSearchWidgetBase<T> {
     Object Function(T item)? groupBy,
     GroupHeaderBuilder? groupHeaderBuilder,
     Comparator<Object>? groupComparator,
-    AccessibilityConfiguration accessibilityConfig = const AccessibilityConfiguration(),
+    AccessibilityConfiguration accessibilityConfig =
+        const AccessibilityConfiguration(),
   }) : this._(
          key: key,
          asyncLoader: asyncLoader,
+         pagedAsyncLoader: pagedAsyncLoader,
          itemBuilder: itemBuilder,
          gridConfig: gridConfig,
          searchFieldBuilder: searchFieldBuilder,
@@ -289,7 +302,8 @@ class SmartSearchGrid<T extends Object> extends SmartSearchWidgetBase<T> {
     Object Function(T item)? groupBy,
     GroupHeaderBuilder? groupHeaderBuilder,
     Comparator<Object>? groupComparator,
-    AccessibilityConfiguration accessibilityConfig = const AccessibilityConfiguration(),
+    AccessibilityConfiguration accessibilityConfig =
+        const AccessibilityConfiguration(),
   }) : this._(
          key: key,
          controller: controller,
@@ -396,6 +410,18 @@ class _SmartSearchGridState<T extends Object> extends State<SmartSearchGrid<T>>
         _scrollController.addListener(_handleKeyboardOnScroll);
       }
     }
+    // Pagination toggled on or off (including null <-> set) on the same scroll
+    // controller: add or remove the pagination listener to match. The swap
+    // branch above already reattaches based on the current config when the
+    // controller itself changed, so this only handles the no-swap case.
+    else if (widget.paginationConfig?.enabled !=
+        oldWidget.paginationConfig?.enabled) {
+      if (widget.paginationConfig?.enabled == true) {
+        _scrollController.addListener(_onScroll);
+      } else {
+        _scrollController.removeListener(_onScroll);
+      }
+    }
 
     // Mixin: controller swap (AnimatedBuilder manages the rebuild listener)
     handleControllerSwap(oldWidget);
@@ -432,7 +458,8 @@ class _SmartSearchGridState<T extends Object> extends State<SmartSearchGrid<T>>
     if (isDisposed) return;
 
     if (_scrollController.hasClients &&
-        _scrollController.position.userScrollDirection != ScrollDirection.idle) {
+        _scrollController.position.userScrollDirection !=
+            ScrollDirection.idle) {
       FocusScope.of(context).unfocus();
     }
   }
@@ -477,7 +504,9 @@ class _SmartSearchGridState<T extends Object> extends State<SmartSearchGrid<T>>
       animation: controller,
       builder: (context, child) {
         return Column(
-          mainAxisSize: widget.gridConfig.shrinkWrap ? MainAxisSize.min : MainAxisSize.max,
+          mainAxisSize: widget.gridConfig.shrinkWrap
+              ? MainAxisSize.min
+              : MainAxisSize.max,
           children: [
             if (widget.searchConfig.enabled) _buildSearchField(),
             if (widget.belowSearchWidget != null) widget.belowSearchWidget!,
@@ -486,7 +515,8 @@ class _SmartSearchGridState<T extends Object> extends State<SmartSearchGrid<T>>
                 context,
                 controller.isLoading || controller.isLoadingMore,
               ),
-            if (widget.sortBuilder != null || widget.filterBuilder != null) _buildControls(),
+            if (widget.sortBuilder != null || widget.filterBuilder != null)
+              _buildControls(),
             Flexible(
               fit: widget.gridConfig.shrinkWrap ? FlexFit.loose : FlexFit.tight,
               flex: widget.gridConfig.shrinkWrap ? 0 : 1,
@@ -501,7 +531,12 @@ class _SmartSearchGridState<T extends Object> extends State<SmartSearchGrid<T>>
 
   Widget _buildSearchField() {
     if (widget.searchFieldBuilder != null) {
-      return widget.searchFieldBuilder!(context, _searchTextController, _focusNode, _clearSearch);
+      return widget.searchFieldBuilder!(
+        context,
+        _searchTextController,
+        _focusNode,
+        _clearSearch,
+      );
     }
 
     return DefaultSearchField(
@@ -545,7 +580,10 @@ class _SmartSearchGridState<T extends Object> extends State<SmartSearchGrid<T>>
     Widget gridWidget = _buildGridView();
 
     if (widget.gridConfig.pullToRefresh) {
-      gridWidget = RefreshIndicator(onRefresh: _handleRefresh, child: gridWidget);
+      gridWidget = RefreshIndicator(
+        onRefresh: _handleRefresh,
+        child: gridWidget,
+      );
     }
 
     return gridWidget;
@@ -568,7 +606,11 @@ class _SmartSearchGridState<T extends Object> extends State<SmartSearchGrid<T>>
     }
 
     if (controller.isLoadingMore) {
-      slivers.add(SliverToBoxAdapter(child: widget.loadingMoreIndicatorBuilder.call(context)));
+      slivers.add(
+        SliverToBoxAdapter(
+          child: widget.loadingMoreIndicatorBuilder.call(context),
+        ),
+      );
     }
 
     return CustomScrollView(
@@ -614,7 +656,11 @@ class _SmartSearchGridState<T extends Object> extends State<SmartSearchGrid<T>>
       slivers.add(
         SliverToBoxAdapter(
           child:
-              widget.groupHeaderBuilder?.call(context, key, groupItems.length) ??
+              widget.groupHeaderBuilder?.call(
+                context,
+                key,
+                groupItems.length,
+              ) ??
               DefaultGroupHeader(groupValue: key, itemCount: groupItems.length),
         ),
       );
@@ -634,7 +680,12 @@ class _SmartSearchGridState<T extends Object> extends State<SmartSearchGrid<T>>
       );
 
       if (widget.gridConfig.padding != null) {
-        slivers.add(SliverPadding(padding: widget.gridConfig.padding!, sliver: gridSliver));
+        slivers.add(
+          SliverPadding(
+            padding: widget.gridConfig.padding!,
+            sliver: gridSliver,
+          ),
+        );
       } else {
         slivers.add(gridSliver);
       }

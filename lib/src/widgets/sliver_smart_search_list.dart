@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../core/smart_search_controller.dart';
 import '../models/accessibility_configuration.dart';
+import '../models/async_loader.dart';
 import '../models/search_configuration.dart';
 import 'default_widgets.dart';
 import 'smart_search_list.dart';
@@ -63,6 +64,7 @@ class SliverSmartSearchList<T extends Object> extends SmartSearchWidgetBase<T> {
     super.key,
     super.items,
     super.asyncLoader,
+    super.pagedAsyncLoader,
     super.searchableFields,
     required super.itemBuilder,
     super.controller,
@@ -119,7 +121,8 @@ class SliverSmartSearchList<T extends Object> extends SmartSearchWidgetBase<T> {
     GroupHeaderBuilder? groupHeaderBuilder,
     Comparator<Object>? groupComparator,
     double groupHeaderExtent = 48.0,
-    AccessibilityConfiguration accessibilityConfig = const AccessibilityConfiguration(),
+    AccessibilityConfiguration accessibilityConfig =
+        const AccessibilityConfiguration(),
   }) : this._(
          key: key,
          items: items,
@@ -148,17 +151,26 @@ class SliverSmartSearchList<T extends Object> extends SmartSearchWidgetBase<T> {
 
   /// Creates an async sliver searchable list that loads data from a remote source.
   ///
-  /// The [asyncLoader] is called with a search query, page index (zero-based),
-  /// and page size. Search matching is delegated to the server;
-  /// [searchableFields] is not accepted. The widget creates and manages its own
+  /// Provide exactly one loader:
+  /// - [asyncLoader] returns a plain list; the controller infers whether more
+  ///   pages exist from the returned length (`items.length == pageSize`).
+  /// - [pagedAsyncLoader] returns a [SearchPage] that states `hasMore`
+  ///   explicitly — use it for variable-sized pages or when an empty page is
+  ///   not the end of the data.
+  ///
+  /// The loader is called with a search query, page index (zero-based), and
+  /// page size. Search matching is delegated to the server; [searchableFields]
+  /// is not accepted. The widget creates and manages its own
   /// [SmartSearchController] internally.
   ///
   /// To drive search programmatically via an external controller, use
   /// [SliverSmartSearchList.controller] with
-  /// [SmartSearchController.setAsyncLoader].
+  /// [SmartSearchController.setAsyncLoader] or
+  /// [SmartSearchController.setPagedAsyncLoader].
   const SliverSmartSearchList.async({
     Key? key,
-    required Future<List<T>> Function(String query, {int page, int pageSize}) asyncLoader,
+    AsyncLoader<T>? asyncLoader,
+    PagedAsyncLoader<T>? pagedAsyncLoader,
     required ItemBuilder<T> itemBuilder,
     LoadingStateBuilder? loadingStateBuilder,
     WidgetBuilder loadingMoreIndicatorBuilder =
@@ -179,10 +191,12 @@ class SliverSmartSearchList<T extends Object> extends SmartSearchWidgetBase<T> {
     GroupHeaderBuilder? groupHeaderBuilder,
     Comparator<Object>? groupComparator,
     double groupHeaderExtent = 48.0,
-    AccessibilityConfiguration accessibilityConfig = const AccessibilityConfiguration(),
+    AccessibilityConfiguration accessibilityConfig =
+        const AccessibilityConfiguration(),
   }) : this._(
          key: key,
          asyncLoader: asyncLoader,
+         pagedAsyncLoader: pagedAsyncLoader,
          itemBuilder: itemBuilder,
          loadingStateBuilder: loadingStateBuilder,
          loadingMoreIndicatorBuilder: loadingMoreIndicatorBuilder,
@@ -239,7 +253,8 @@ class SliverSmartSearchList<T extends Object> extends SmartSearchWidgetBase<T> {
     GroupHeaderBuilder? groupHeaderBuilder,
     Comparator<Object>? groupComparator,
     double groupHeaderExtent = 48.0,
-    AccessibilityConfiguration accessibilityConfig = const AccessibilityConfiguration(),
+    AccessibilityConfiguration accessibilityConfig =
+        const AccessibilityConfiguration(),
   }) : this._(
          key: key,
          controller: controller,
@@ -264,10 +279,12 @@ class SliverSmartSearchList<T extends Object> extends SmartSearchWidgetBase<T> {
        );
 
   @override
-  State<SliverSmartSearchList<T>> createState() => _SliverSmartSearchListState<T>();
+  State<SliverSmartSearchList<T>> createState() =>
+      _SliverSmartSearchListState<T>();
 }
 
-class _SliverSmartSearchListState<T extends Object> extends State<SliverSmartSearchList<T>>
+class _SliverSmartSearchListState<T extends Object>
+    extends State<SliverSmartSearchList<T>>
     with SmartSearchStateMixin<T, SliverSmartSearchList<T>> {
   /// Tracks the last query value to detect changes and fire [onSearchChanged].
   String _lastSearchQuery = '';
@@ -368,7 +385,10 @@ class _SliverSmartSearchListState<T extends Object> extends State<SliverSmartSea
     );
 
     if (widget.listConfig.padding != null) {
-      sliverList = SliverPadding(padding: widget.listConfig.padding!, sliver: sliverList);
+      sliverList = SliverPadding(
+        padding: widget.listConfig.padding!,
+        sliver: sliverList,
+      );
     }
 
     return sliverList;
@@ -391,8 +411,15 @@ class _SliverSmartSearchListState<T extends Object> extends State<SliverSmartSea
                 maxExtent: widget.groupHeaderExtent,
                 minExtent: widget.groupHeaderExtent,
                 child:
-                    widget.groupHeaderBuilder?.call(context, key, groupItems.length) ??
-                    DefaultGroupHeader(groupValue: key, itemCount: groupItems.length),
+                    widget.groupHeaderBuilder?.call(
+                      context,
+                      key,
+                      groupItems.length,
+                    ) ??
+                    DefaultGroupHeader(
+                      groupValue: key,
+                      itemCount: groupItems.length,
+                    ),
               ),
             ),
             _buildGroupListSliver(groupItems, searchTerms),
@@ -403,7 +430,11 @@ class _SliverSmartSearchListState<T extends Object> extends State<SliverSmartSea
 
     // Loading more indicator
     if (controller.isLoadingMore) {
-      slivers.add(SliverToBoxAdapter(child: widget.loadingMoreIndicatorBuilder.call(context)));
+      slivers.add(
+        SliverToBoxAdapter(
+          child: widget.loadingMoreIndicatorBuilder.call(context),
+        ),
+      );
     }
 
     // build() must return a single Widget, so wrap all group slivers in a
@@ -413,7 +444,10 @@ class _SliverSmartSearchListState<T extends Object> extends State<SliverSmartSea
 
   /// Builds a per-group [SliverList], optionally wrapped in [SliverPadding].
   /// Mirrors [SliverSmartSearchGrid._buildGroupGrid] padding logic.
-  Widget _buildGroupListSliver(List<IndexedItem<T>> groupItems, List<String> searchTerms) {
+  Widget _buildGroupListSliver(
+    List<IndexedItem<T>> groupItems,
+    List<String> searchTerms,
+  ) {
     Widget listSliver = SliverList(
       delegate: SliverChildBuilderDelegate(
         (context, index) {
@@ -428,7 +462,10 @@ class _SliverSmartSearchListState<T extends Object> extends State<SliverSmartSea
     );
 
     if (widget.listConfig.padding != null) {
-      listSliver = SliverPadding(padding: widget.listConfig.padding!, sliver: listSliver);
+      listSliver = SliverPadding(
+        padding: widget.listConfig.padding!,
+        sliver: listSliver,
+      );
     }
 
     return listSliver;

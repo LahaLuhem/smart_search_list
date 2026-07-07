@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
+import '../models/async_loader.dart';
 import 'fuzzy_utils.dart';
 
 /// Controller for managing search, filter, sort, and pagination state.
@@ -103,15 +104,20 @@ class SmartSearchController<T extends Object> extends ChangeNotifier {
   // Async management
   Timer? _debounceTimer;
   int _requestId = 0;
-  Future<List<T>> Function(String query, {int page, int pageSize})?
-  _asyncLoader;
+
+  /// The active loader, always normalized to the paged contract.
+  ///
+  /// [setAsyncLoader] wraps a plain-list loader with the page-size heuristic;
+  /// [setPagedAsyncLoader] installs one that reports [SearchPage.hasMore]
+  /// itself. Downstream code only ever deals with [SearchPage].
+  PagedAsyncLoader<T>? _pagedLoader;
 
   // Pagination
   int _currentPage = 0;
   bool _hasMorePages = true;
 
   // Cache
-  final Map<String, List<T>> _cache = {};
+  final Map<String, SearchPage<T>> _cache = {};
   final List<String> _cacheKeys = [];
 
   // Filtering and sorting
@@ -203,13 +209,34 @@ class SmartSearchController<T extends Object> extends ChangeNotifier {
     _notifyListeners();
   }
 
-  /// Sets the async data loader. Does not trigger a search — call
+  /// Sets a plain-list async data loader. Does not trigger a search — call
   /// [search] or [refresh] after.
-  void setAsyncLoader(
-    Future<List<T>> Function(String query, {int page, int pageSize}) loader,
-  ) {
+  ///
+  /// "Are there more pages?" is inferred from the returned length: a full page
+  /// (`items.length == pageSize`) implies more may follow, a short page ends
+  /// pagination. When that heuristic doesn't fit — variable-sized pages, or
+  /// empty pages that aren't the end — use [setPagedAsyncLoader] instead.
+  void setAsyncLoader(AsyncLoader<T> loader) {
     if (_isDisposed) return;
-    _asyncLoader = loader;
+    // Adapt to the paged contract so all downstream code deals only with
+    // SearchPage. hasMore keeps the historical page-size heuristic.
+    _pagedLoader = (query, {int page = 0, int pageSize = 20}) async {
+      final items = await loader(query, page: page, pageSize: pageSize);
+      return SearchPage(items: items, hasMore: items.length == pageSize);
+    };
+  }
+
+  /// Sets an async loader that reports [SearchPage.hasMore] explicitly instead
+  /// of the controller inferring it from the returned page size. Does not
+  /// trigger a search — call [search] or [refresh] after.
+  ///
+  /// Use this for variable-sized pages, or when an empty page is not the end
+  /// of the data (the loader can return no items yet still set `hasMore: true`
+  /// to keep paging). Mutually exclusive with [setAsyncLoader] — the last one
+  /// set wins.
+  void setPagedAsyncLoader(PagedAsyncLoader<T> loader) {
+    if (_isDisposed) return;
+    _pagedLoader = loader;
   }
 
   // ---------------------------------------------------------------------------
@@ -331,7 +358,7 @@ class SmartSearchController<T extends Object> extends ChangeNotifier {
     assert(_hasSearched, 'hasSearched must be true after search begins');
     assert(_currentPage == 0, 'Page must reset to 0 on new search');
 
-    if (_asyncLoader != null) {
+    if (_pagedLoader != null) {
       await _loadAsyncData();
     } else {
       _applyFiltersAndSort();
@@ -340,14 +367,16 @@ class SmartSearchController<T extends Object> extends ChangeNotifier {
   }
 
   Future<void> _loadAsyncData() async {
-    if (_isDisposed || _asyncLoader == null) return;
+    if (_isDisposed || _pagedLoader == null) return;
 
     final cacheKey = _getCacheKey();
 
     // Check cache first
-    if (cacheResults && _cache.containsKey(cacheKey)) {
+    final cached = _cache[cacheKey];
+    if (cacheResults && cached != null) {
       // Defensive copy — loadMore mutates _filteredItems via addAll.
-      _filteredItems = List.from(_cache[cacheKey]!);
+      _filteredItems = List.from(cached.items);
+      _hasMorePages = cached.hasMore;
       _notifyListeners();
       return;
     }
@@ -357,7 +386,7 @@ class SmartSearchController<T extends Object> extends ChangeNotifier {
     final currentRequestId = ++_requestId;
 
     try {
-      final results = await _asyncLoader!(
+      final page = await _pagedLoader!(
         _searchQuery,
         page: _currentPage,
         pageSize: pageSize,
@@ -366,13 +395,15 @@ class SmartSearchController<T extends Object> extends ChangeNotifier {
       // Ignore if newer request was made
       if (_isDisposed || currentRequestId != _requestId) return;
 
-      _filteredItems = results;
-      _hasMorePages = results.length == pageSize;
+      // Defensive growable copy — the loader may hand back a const or
+      // fixed-length list, and loadMore mutates _filteredItems via addAll.
+      _filteredItems = List.from(page.items);
+      _hasMorePages = page.hasMore;
       assert(_error == null, 'Error must be null after successful async load');
 
       // Cache results
       if (cacheResults) {
-        _addToCache(cacheKey, results);
+        _addToCache(cacheKey, page);
       }
     } catch (e) {
       if (_isDisposed || currentRequestId != _requestId) return;
@@ -400,9 +431,9 @@ class SmartSearchController<T extends Object> extends ChangeNotifier {
     assert(() {
       if (_searchQuery.isNotEmpty &&
           searchableFields == null &&
-          _asyncLoader == null) {
+          _pagedLoader == null) {
         debugPrint(
-          'SmartSearchController: searchableFields is null and no asyncLoader '
+          'SmartSearchController: searchableFields is null and no async loader '
           'is set. Search queries will not filter results. Pass '
           'searchableFields to the controller constructor for offline search.',
         );
@@ -549,7 +580,7 @@ class SmartSearchController<T extends Object> extends ChangeNotifier {
     if (_isDisposed ||
         !_hasMorePages ||
         _isLoadingMore ||
-        _asyncLoader == null) {
+        _pagedLoader == null) {
       return;
     }
 
@@ -560,7 +591,7 @@ class SmartSearchController<T extends Object> extends ChangeNotifier {
 
     try {
       final nextPage = _currentPage + 1;
-      final results = await _asyncLoader!(
+      final page = await _pagedLoader!(
         _searchQuery,
         page: nextPage,
         pageSize: pageSize,
@@ -568,13 +599,12 @@ class SmartSearchController<T extends Object> extends ChangeNotifier {
 
       if (_isDisposed || currentRequestId != _requestId) return;
 
-      if (results.isEmpty) {
-        _hasMorePages = false;
-      } else {
-        _currentPage = nextPage;
-        _filteredItems.addAll(results);
-        _hasMorePages = results.length == pageSize;
-      }
+      // The loader owns the hasMore decision: an empty page may still set
+      // hasMore true (e.g. an empty day with older days to come), so we
+      // advance and append unconditionally and trust page.hasMore.
+      _currentPage = nextPage;
+      _filteredItems.addAll(page.items);
+      _hasMorePages = page.hasMore;
     } catch (e) {
       if (!_isDisposed && currentRequestId == _requestId) {
         _setError(e);
@@ -625,7 +655,7 @@ class SmartSearchController<T extends Object> extends ChangeNotifier {
     return '${_searchQuery}_${_currentPage}_${filterKeys.join(',')}_fv$_filterVersion';
   }
 
-  void _addToCache(String key, List<T> items) {
+  void _addToCache(String key, SearchPage<T> page) {
     // When maxCacheSize is 0, caching is effectively disabled.
     if (maxCacheSize <= 0) return;
 
@@ -634,7 +664,11 @@ class SmartSearchController<T extends Object> extends ChangeNotifier {
       _cache.remove(oldestKey);
     }
 
-    _cache[key] = List.from(items);
+    // Defensive copy of items — loadMore mutates _filteredItems via addAll.
+    _cache[key] = SearchPage(
+      items: List.from(page.items),
+      hasMore: page.hasMore,
+    );
     _cacheKeys.add(key);
     assert(
       _cache.length == _cacheKeys.length,

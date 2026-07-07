@@ -3,6 +3,7 @@ import 'package:flutter/rendering.dart';
 
 import '../core/smart_search_controller.dart';
 import '../models/accessibility_configuration.dart';
+import '../models/async_loader.dart';
 import '../models/search_configuration.dart';
 import 'default_widgets.dart';
 import 'sliver_smart_search_list.dart';
@@ -94,6 +95,7 @@ class SmartSearchList<T extends Object> extends SmartSearchWidgetBase<T> {
     super.key,
     super.items,
     super.asyncLoader,
+    super.pagedAsyncLoader,
     super.searchableFields,
     required super.itemBuilder,
     super.controller,
@@ -164,7 +166,8 @@ class SmartSearchList<T extends Object> extends SmartSearchWidgetBase<T> {
     Object Function(T item)? groupBy,
     GroupHeaderBuilder? groupHeaderBuilder,
     Comparator<Object>? groupComparator,
-    AccessibilityConfiguration accessibilityConfig = const AccessibilityConfiguration(),
+    AccessibilityConfiguration accessibilityConfig =
+        const AccessibilityConfiguration(),
   }) : this._(
          key: key,
          items: items,
@@ -200,19 +203,28 @@ class SmartSearchList<T extends Object> extends SmartSearchWidgetBase<T> {
 
   /// Creates an async searchable list that loads data from a remote source.
   ///
-  /// The [asyncLoader] is called with a search query, page index (zero-based),
-  /// and page size. It is called with an empty string on initial load — handle
-  /// `''` as "load all".
+  /// Provide exactly one loader:
+  /// - [asyncLoader] returns a plain list; the controller infers whether more
+  ///   pages exist from the returned length (`items.length == pageSize`).
+  /// - [pagedAsyncLoader] returns a [SearchPage] that states `hasMore`
+  ///   explicitly — use it for variable-sized pages or when an empty page is
+  ///   not the end of the data.
+  ///
+  /// The loader is called with a search query, page index (zero-based), and
+  /// page size, and with an empty string on initial load — handle `''` as
+  /// "load all".
   ///
   /// Search matching is delegated to the server; [searchableFields] is not
   /// accepted. The widget creates and manages its own [SmartSearchController]
   /// internally.
   ///
   /// To drive search programmatically via an external controller, use
-  /// [SmartSearchList.controller] with [SmartSearchController.setAsyncLoader].
+  /// [SmartSearchList.controller] with [SmartSearchController.setAsyncLoader]
+  /// or [SmartSearchController.setPagedAsyncLoader].
   const SmartSearchList.async({
     Key? key,
-    required Future<List<T>> Function(String query, {int page, int pageSize}) asyncLoader,
+    AsyncLoader<T>? asyncLoader,
+    PagedAsyncLoader<T>? pagedAsyncLoader,
     required ItemBuilder<T> itemBuilder,
     SearchFieldBuilder? searchFieldBuilder,
     SeparatorBuilder? separatorBuilder,
@@ -240,10 +252,12 @@ class SmartSearchList<T extends Object> extends SmartSearchWidgetBase<T> {
     Object Function(T item)? groupBy,
     GroupHeaderBuilder? groupHeaderBuilder,
     Comparator<Object>? groupComparator,
-    AccessibilityConfiguration accessibilityConfig = const AccessibilityConfiguration(),
+    AccessibilityConfiguration accessibilityConfig =
+        const AccessibilityConfiguration(),
   }) : this._(
          key: key,
          asyncLoader: asyncLoader,
+         pagedAsyncLoader: pagedAsyncLoader,
          itemBuilder: itemBuilder,
          searchFieldBuilder: searchFieldBuilder,
          separatorBuilder: separatorBuilder,
@@ -313,7 +327,8 @@ class SmartSearchList<T extends Object> extends SmartSearchWidgetBase<T> {
     Object Function(T item)? groupBy,
     GroupHeaderBuilder? groupHeaderBuilder,
     Comparator<Object>? groupComparator,
-    AccessibilityConfiguration accessibilityConfig = const AccessibilityConfiguration(),
+    AccessibilityConfiguration accessibilityConfig =
+        const AccessibilityConfiguration(),
   }) : this._(
          key: key,
          controller: controller,
@@ -423,6 +438,18 @@ class _SmartSearchListState<T extends Object> extends State<SmartSearchList<T>>
         _scrollController.addListener(_handleKeyboardOnScroll);
       }
     }
+    // Pagination toggled on or off (including null <-> set) on the same scroll
+    // controller: add or remove the pagination listener to match. The swap
+    // branch above already reattaches based on the current config when the
+    // controller itself changed, so this only handles the no-swap case.
+    else if (widget.paginationConfig?.enabled !=
+        oldWidget.paginationConfig?.enabled) {
+      if (widget.paginationConfig?.enabled == true) {
+        _scrollController.addListener(_onScroll);
+      } else {
+        _scrollController.removeListener(_onScroll);
+      }
+    }
 
     // Mixin: controller swap (AnimatedBuilder manages the rebuild listener)
     handleControllerSwap(oldWidget);
@@ -459,7 +486,8 @@ class _SmartSearchListState<T extends Object> extends State<SmartSearchList<T>>
     if (isDisposed) return;
 
     if (_scrollController.hasClients &&
-        _scrollController.position.userScrollDirection != ScrollDirection.idle) {
+        _scrollController.position.userScrollDirection !=
+            ScrollDirection.idle) {
       FocusScope.of(context).unfocus();
     }
   }
@@ -513,7 +541,9 @@ class _SmartSearchListState<T extends Object> extends State<SmartSearchList<T>>
       animation: controller,
       builder: (context, child) {
         return Column(
-          mainAxisSize: widget.listConfig.shrinkWrap ? MainAxisSize.min : MainAxisSize.max,
+          mainAxisSize: widget.listConfig.shrinkWrap
+              ? MainAxisSize.min
+              : MainAxisSize.max,
           children: [
             // Search field
             if (widget.searchConfig.enabled) _buildSearchField(),
@@ -529,7 +559,8 @@ class _SmartSearchListState<T extends Object> extends State<SmartSearchList<T>>
               ),
 
             // Sort and filter controls
-            if (widget.sortBuilder != null || widget.filterBuilder != null) _buildControls(),
+            if (widget.sortBuilder != null || widget.filterBuilder != null)
+              _buildControls(),
 
             // Main list
             Flexible(
@@ -545,7 +576,12 @@ class _SmartSearchListState<T extends Object> extends State<SmartSearchList<T>>
 
   Widget _buildSearchField() {
     if (widget.searchFieldBuilder != null) {
-      return widget.searchFieldBuilder!(context, _searchTextController, _focusNode, _clearSearch);
+      return widget.searchFieldBuilder!(
+        context,
+        _searchTextController,
+        _focusNode,
+        _clearSearch,
+      );
     }
 
     return DefaultSearchField(
@@ -592,7 +628,10 @@ class _SmartSearchListState<T extends Object> extends State<SmartSearchList<T>>
 
     // Add pull-to-refresh if enabled
     if (widget.listConfig.pullToRefresh) {
-      listWidget = RefreshIndicator(onRefresh: _handleRefresh, child: listWidget);
+      listWidget = RefreshIndicator(
+        onRefresh: _handleRefresh,
+        child: listWidget,
+      );
     }
 
     return listWidget;
@@ -662,12 +701,21 @@ class _SmartSearchListState<T extends Object> extends State<SmartSearchList<T>>
       clipBehavior: widget.listConfig.clipBehavior,
       itemCount: _totalGroupedItemCount(groups.order, groups.map),
       itemBuilder: (context, flatIndex) {
-        return _groupedItemBuilder(context, flatIndex, groups.order, groups.map, searchTerms);
+        return _groupedItemBuilder(
+          context,
+          flatIndex,
+          groups.order,
+          groups.map,
+          searchTerms,
+        );
       },
     );
   }
 
-  int _totalGroupedItemCount(List<Object> groupOrder, Map<Object, List<IndexedItem<T>>> groupMap) {
+  int _totalGroupedItemCount(
+    List<Object> groupOrder,
+    Map<Object, List<IndexedItem<T>>> groupMap,
+  ) {
     int count = 0;
     for (final key in groupOrder) {
       count += 1 + groupMap[key]!.length; // 1 header + items
@@ -688,7 +736,11 @@ class _SmartSearchListState<T extends Object> extends State<SmartSearchList<T>>
       final groupItems = groupMap[key]!;
       if (flatIndex == current) {
         // This is a group header
-        return widget.groupHeaderBuilder?.call(context, key, groupItems.length) ??
+        return widget.groupHeaderBuilder?.call(
+              context,
+              key,
+              groupItems.length,
+            ) ??
             DefaultGroupHeader(groupValue: key, itemCount: groupItems.length);
       }
       current += 1; // header
